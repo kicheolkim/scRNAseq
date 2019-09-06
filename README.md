@@ -1,2 +1,2 @@
 # scRNAseq
-scRNA-seq analysis (10xGenomics platform based)
+scRNA-seq analysis (using 10xGenomics platform)
