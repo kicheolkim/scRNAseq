@@ -1,0 +1,839 @@
+##### single-cell RNA-Seq analysis
+```{r, warning=FALSE,echo=FALSE}
+library(Seurat)
+setwd("C:/Users/kicheol/Desktop/Projects/Andres_scRNA/Results_Seurat_new_NoCorrection")
+```
+
+## Load the Cell Ranger Matrix Data and create the base Seurat object.
+```{r}
+## Dataset for analysis
+setwd("C:/Users/kicheol/Desktop/Projects/Andres_scRNA/R")
+dataset_loc <- "."
+#ids <- c("AC2262_1", "AC2262_2", "AC2262_3", "AC2262_4")    # removed 2nd sample because low quality
+ids <- c("AC2262_1", "AC2262_3", "AC2262_4")
+
+d10x.data <- sapply(ids, function(i){
+  d10x <- Read10X(file.path(i))
+  colnames(d10x) <- paste(sapply(strsplit(colnames(d10x),split="-"),'[[',1L),i,sep="-")
+  d10x
+})
+
+experiment.data <- do.call("cbind", d10x.data)
+
+experiment.aggr <- CreateSeuratObject(
+  experiment.data,
+  project = "Andres_AC2262", 
+  min.cells = 2,
+  min.genes = 100,
+  names.field = 2,
+  names.delim = "\\-")
+
+experiment.aggr          # 3 time-point without sample2
+experiment.aggr.all      # 4 time-point including sample2
+
+setwd("C:/Users/kicheol/Desktop/Projects/Andres_scRNA/Results_Seurat_new_NoCorrection")
+```
+
+
+Calculate percent mitochondrial genes per cell
+```{r}
+mito.genes <- grep("^mt-", rownames(experiment.aggr@data), value = T)
+percent.mito <- Matrix::colSums(experiment.aggr@raw.data[mito.genes, ]) / Matrix::colSums(experiment.aggr@raw.data)
+
+# AddMetaData adds columns to object@data.info, and is a great place to stash QC stats
+experiment.aggr <- AddMetaData(
+  object = experiment.aggr,
+  metadata = percent.mito,
+  col.name= "percent.mito")
+```
+
+
+```{r}
+samplename = experiment.aggr@meta.data$orig.ident
+table(samplename)     # numbers = number of cells
+
+batchid = rep("3_Chronic",length(samplename))
+#batchid[samplename %in% c("AC2262_2")] = "2_Peak"
+batchid[samplename %in% c("AC2262_3")] = "2_PreOnset"
+batchid[samplename %in% c("AC2262_4")] = "1_Baseline"
+names(batchid) = rownames(experiment.aggr@meta.data)
+
+experiment.aggr <- AddMetaData(
+  object = experiment.aggr,
+  metadata = batchid,
+  col.name = "batchid")
+table(experiment.aggr@meta.data$batchid)
+
+```
+
+
+```{r}
+## Original dataset in Seurat class, with no filtering
+save(experiment.aggr,file="original_seurat_object.RData")
+# write.table(as.matrix(experiment.data),"raw.datatable.txt",sep="\t",col.names=T,row.names=T)
+experiment.aggr                       ### 14579 genes across 1174 samples. (filtered by min.cell=2, min.gene=50)
+                                      ### without sample2: 14465 genes across 818 samples.
+# loading saved object (Seurat class)
+load("original_seurat_object.RData")
+```
+
+### Seurat object.
+```{r}
+slotNames(experiment.aggr)
+head(experiment.aggr@meta.data)
+table(experiment.aggr@meta.data$orig.ident)
+```
+
+## Some basic QA/QC of the metadata, print tables of the 5% quantiles.
+```{r}
+do.call("cbind", tapply(experiment.aggr@meta.data$nGene,experiment.aggr@ident,quantile,probs=seq(0,1,0.05)))
+```
+
+Show 5% qunatiles for number of UMI per cell per sample
+```{r}
+do.call("cbind", tapply(experiment.aggr@meta.data$nUMI,experiment.aggr@ident,quantile,probs=seq(0,1,0.05)))
+```
+
+Show 5% qunatiles for number of mitochondrial percentage per cell per sample
+```{r}
+round(do.call("cbind", tapply(experiment.aggr@meta.data$percent.mito,experiment.aggr@ident,quantile,probs=seq(0,1,0.05))), digits = 3)
+```
+
+Plot the number of cells each gene is represented by
+```{r}
+plot(sort(Matrix::rowSums(experiment.aggr@data>=2)) , xlab="gene rank", ylab="number of cells", main="Cells per genes ( >= 2 )")
+```
+
+Violin plot of 1) number of genes, 2) number of UMI and 3) percent mitochondrial genes
+```{r, fig.height=20}
+VlnPlot(
+  experiment.aggr,
+  c("nGene", "nUMI","percent.mito"),
+  nCol = 1)
+
+```
+
+Gene Plot, scatter plot of gene expression across cells, (colored by sample)
+```{r}
+GenePlot(
+  experiment.aggr, "nUMI", "nGene", 
+  cex.use = 0.5)
+```
+
+
+### Cell filtering
+
+```{r}
+experiment.aggr <- FilterCells(
+  object = experiment.aggr,
+  subset.names = c("percent.mito"),
+  low.thresholds = c(-Inf),
+  high.thresholds = c(0.4))
+
+experiment.aggr <- FilterCells(
+  object = experiment.aggr,
+  subset.names = c("nUMI"),
+  low.thresholds = c(400),
+  high.thresholds = c(20000))
+
+experiment.aggr      # 14465 genes across 789 samples. (without sample2)
+```
+
+```{r}
+table(experiment.aggr@meta.data$orig.ident)
+```
+
+
+## normalize the data
+
+```{r}
+experiment.aggr <- NormalizeData(
+  object = experiment.aggr,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000)
+
+```
+
+check normalized dataset
+```{r}
+head(experiment.aggr@data)
+range(experiment.aggr@data)
+head(experiment.aggr@raw.data)
+
+hist(as.matrix(experiment.aggr@data))
+hist(as.matrix(experiment.aggr@raw.data))
+```
+
+
+### filter out additional genes.
+
+```{r}
+FilterGenes <- 
+function (object, min.value=1, min.cells = 0, genes = NULL) {
+  parameters.to.store <- as.list(environment(), all = TRUE)[names(formals("FilterGenes"))]
+  object <- Seurat:::SetCalcParams(object = object, calculation = "FilterGenes", ... = parameters.to.store)
+  genes.use <- rownames(object@data)
+
+  if (!is.null(genes)) {
+    genes.use <- intersect(genes.use, genes)
+    object@data <- object@data[genes.use, ]
+    return(object)
+  } else if (min.cells > 0) {
+    num.cells <- Matrix::rowSums(object@data > min.value)
+    genes.use <- names(num.cells[which(num.cells >= min.cells)])
+    object@data <- object@data[genes.use, ]
+    return(object)
+  } else {
+    return(object)
+  }
+}
+
+experiment.aggr <- FilterGenes(object = experiment.aggr, min.value = 1, min.cells = 10)
+experiment.aggr
+```
+
+About 4,000 genes were removed.
+
+```{r}
+save(experiment.aggr,file="filtered_seurat_object.RData")
+load(file="filtered_seurat_object.RData")
+```
+
+
+## Identify variable genes
+
+```{r}
+experiment.aggr <- FindVariableGenes(
+  object = experiment.aggr,
+  mean.function = ExpMean,
+  dispersion.function = LogVMR,
+  x.low.cutoff = 0.1,
+  x.high.cutoff = 4,
+  y.cutoff = 0.4)
+
+length(experiment.aggr@var.genes)      # select highly variable genes (reduce for PCA or else)
+```
+
+Lets save the filtered and normalized data
+```{r}
+save(experiment.aggr, file="pre_sample_corrected.RData")
+
+load(file="pre_sample_corrected.RData")
+```
+
+
+make variable gene list
+```{r}
+var.genes <- sapply(X=experiment.aggr@var.genes, FUN=list)
+p <- lapply(X=var.genes, FUN=function(var.gene){
+  VlnPlot(object=experiment.aggr, features.plot = var.gene, group.by = "orig.ident")
+})
+
+p <- lapply(X=head(var.genes), FUN=function(var.gene){
+  VlnPlot(object=experiment.aggr, features.plot = var.gene, group.by = "orig.ident")
+})  # head makes it quick
+
+head(p)
+p$Fam178b
+
+```
+
+
+
+
+## Batch effects  -> decide to do not use!!! It change gene expression level a lot. Use only scaling
+
+```{r}
+#experiment.aggr <- ScaleData(
+#  object = experiment.aggr,
+#  do.scale = FALSE,
+#  do.center = FALSE,
+#  vars.to.regress = c("percent.mito"))   # batch effect correction with mitochondrial percentage
+
+#experiment.aggr <- ScaleData(
+#  object = experiment.aggr,
+#  do.scale = FALSE,
+#  do.center = FALSE,
+#  vars.to.regress = c("orig.ident","percent.mito"))    # batch effect correction with batch ID and mitochondrial percentage
+
+#r <- lapply(X=head(var.genes), FUN=function(var.gene){
+#  VlnPlot(object=experiment.aggr, features.plot = var.gene, group.by = "orig.ident")
+#})
+
+#norm.data <- experiment.aggr@data
+#experiment.aggr@data <- experiment.aggr@scale.data
+
+experiment.aggr <- ScaleData(
+  object = experiment.aggr, 
+  vars.to.regress = c("nUMI","percent.mito"))
+
+#experiment.aggr <- ScaleData(
+#  object = experiment.aggr,
+#  genes.use=experiment.aggr@var.genes)
+```
+
+## Dimensionality reduction with PCA 
+
+```{r}
+experiment.aggr <- RunPCA(
+  object = experiment.aggr,
+  pc.genes = experiment.aggr@var.genes,
+  do.print = TRUE,
+  pcs.print = 1:3,
+  genes.print = 5,
+  pcs.compute = 40,
+  maxit = 500)
+
+PrintPCAParams(experiment.aggr)
+```
+
+Seurat then provides a number of ways to visualize the PCA results
+```{r}
+PCAPlot(
+  object = experiment.aggr,
+  dim.1 = 1,
+  dim.2 = 2 )
+```
+
+Visualize top genes associated with principal components
+```{r}
+VizPCA(
+  object = experiment.aggr,
+  pcs.use=1:4
+)
+```
+
+
+```{r}
+PCHeatmap(
+    object = experiment.aggr, 
+    pc.use = 1:6, 
+    cells.use = 500, 
+    do.balanced = TRUE, 
+    label.columns = FALSE,
+    use.full = FALSE
+)
+PCHeatmap(
+    object = experiment.aggr, 
+    pc.use = 7:12, 
+    cells.use = 500, 
+    do.balanced = TRUE, 
+    label.columns = FALSE,
+    use.full = FALSE
+)
+```
+
+### Selecting which PCs to use
+
+```{r}
+PCElbowPlot(
+  experiment.aggr,
+  num.pc = 40)
+```
+
+JackStraw 
+
+```{r}
+# permutation
+experiment.aggr <- JackStraw(
+    object = experiment.aggr, 
+    num.replicate = 100, 
+    num.pc = 40,
+    do.print = FALSE
+)
+
+JackStrawPlot(object = experiment.aggr, PCs = 1:40, nCol = 5)
+```
+
+Looking at the results of the JackStraw plot, we determine to use the first 35 PCs
+```{r}
+use.pcs = 1:18
+```
+
+## Identifying clusters
+
+```{r}
+experiment.aggr <- FindClusters(
+    object = experiment.aggr, 
+    reduction.type = "pca", 
+    dims.use = use.pcs, 
+    resolution = seq(0.5,4,0.5), 
+    print.output = FALSE, 
+    save.SNN = TRUE
+)
+PrintFindClustersParams(object = experiment.aggr)
+```
+
+Lets first investigate how many clusters each resolution produces and set it to the smallest resolutions of 0.5 (fewest clusters). finnaly lets produce a table of cluster to sample assignments.
+
+```{r}
+sapply(grep("^res",colnames(experiment.aggr@meta.data),value = TRUE),
+       function(x) length(unique(experiment.aggr@meta.data[,x])))
+
+experiment.aggr <- SetAllIdent(experiment.aggr, id = "res.4")
+experiment.aggr <- SetAllIdent(experiment.aggr, id = "res.0.5")
+
+table(experiment.aggr@ident,experiment.aggr@meta.data$orig.ident)
+table(experiment.aggr@ident,experiment.aggr@meta.data$batchid)
+```
+
+tSNE 
+```{r}
+experiment.aggr <- RunTSNE(
+  object = experiment.aggr,
+  reduction.use = "pca",
+  dims.use = use.pcs,
+  do.fast = TRUE)
+```
+
+
+Plot TSNE coloring by the slot 'ident' (default).
+```{r}
+TSNEPlot(object = experiment.aggr, pt.shape="batchid", pt.size=1.5)
+TSNEPlot(object = experiment.aggr, group.by="batchid", pt.size=1.5)
+```
+
+Plot TSNE coloring by the slot 'orig.ident' (sample names).
+```{r}
+TSNEPlot(object = experiment.aggr, group.by="orig.ident", pt.size=1.2)
+TSNEPlot(object = experiment.aggr, group.by="res.2", pt.size=1.5, do.label = TRUE, label.size = 6)
+
+# Plot TSNE coloring by the clustering resolution 4.5
+pdf("tSNE_plots.pdf", paper='USr')
+TSNEPlot(object = experiment.aggr, group.by="batchid", plot.title="tNSE, time-point", pt.size=1.2)
+TSNEPlot(object = experiment.aggr, group.by="res.0.5", plot.title="tNSE (res=0.5)", pt.size=1.2, do.label = TRUE)
+TSNEPlot(object = experiment.aggr, group.by="res.1", plot.title="tNSE (res=1)", pt.size=1.2, do.label = TRUE)
+TSNEPlot(object = experiment.aggr, group.by="res.1.5", plot.title="tNSE (res=1.5)", pt.size=1.2, do.label = TRUE)
+TSNEPlot(object = experiment.aggr, group.by="res.2", plot.title="tNSE (res=2)", pt.size=1.2, do.label = TRUE)
+TSNEPlot(object = experiment.aggr, group.by="res.2.5", plot.title="tNSE (res=2.5)", pt.size=1.2, do.label = TRUE)
+TSNEPlot(object = experiment.aggr, group.by="res.3", plot.title="tNSE (res=3)", pt.size=1.2, do.label = TRUE)
+TSNEPlot(object = experiment.aggr, group.by="res.3.5", plot.title="tNSE (res=3.5)", pt.size=1.2, do.label = TRUE)
+TSNEPlot(object = experiment.aggr, group.by="res.4", plot.title="tNSE (res=4)", pt.size=1.2, do.label = TRUE)
+dev.off()
+```
+
+FeaturePlot can be used to color cells with a 'feature', non categorical data, like number of UMIs
+```{r}
+FeaturePlot(experiment.aggr, features.plot=c('nUMI'), pt.size=0.9)
+# and number of genes present
+FeaturePlot(experiment.aggr, features.plot=c('nGene'), pt.size=0.9)
+# and percent mitochondrial 
+FeaturePlot(experiment.aggr, features.plot=c('percent.mito'), pt.size=0.9)
+```
+
+## Building  a  tree relating the 'average' cell from each cluster. Tree is estimated based on a distance matrix constructed in either gene expression space or PCA space.
+
+```{r}
+experiment.aggr <- BuildClusterTree(
+  experiment.aggr,
+  do.reorder = F,
+  reorder.numeric = F,
+#  SNN.use = experiment.aggr@snn,
+  do.plot=F)
+
+PlotClusterTree(experiment.aggr)
+```
+
+Plot the split at node 30
+```{r}
+ColorTSNESplit(experiment.aggr, node = 15)
+```
+
+
+## Identifying Marker Genes
+
+Seurat can help you find markers that define clusters via differential expression.
+`FindMarkers` identifies markers for a cluster relative to all other clusters.
+`FindAllMarkers` does so for all clusters     *** take a long time to run **
+`FindAllMarkersNode` defines all markers that split a Node __(Warning: need to validate)__
+
+```{r}
+experiment.aggr <- SetAllIdent(experiment.aggr, id = "res.0.5")    # select resolution of tree
+
+markers = FindMarkers(experiment.aggr, ident.1=c(0), genes.use=rownames(experiment.aggr@scale.data))   # find marker for single cluster
+
+head(markers)
+dim(markers)
+table(markers$avg_logFC > 0)
+```
+
+
+violin plot to visualize the expression pattern of some markers
+```{r}
+VlnPlot(object = experiment.aggr, features.plot = rownames(markers)[1:10])
+```
+
+Or a feature plot
+```{r}
+FeaturePlot(
+    experiment.aggr, 
+    head(rownames(markers)), 
+    cols.use = c("lightgrey", "blue"), 
+    nCol = 3
+)
+
+# feature plot for CD11b (ITGAM) marker
+FeaturePlot(
+    experiment.aggr, c("Itgam"), no.legend = FALSE,
+    cols.use = c("lightgrey", "red"))
+
+```
+
+FindAllMarkers 
+```{r}
+setwd("C:/Users/kicheol/Desktop/Projects/Andres_scRNA/Results_Seurat_new_NoCorrection/AllCells")
+ids = c("res.2","res.4")
+
+# resolution 2
+experiment.aggr <- SetAllIdent(experiment.aggr, id = ids[1])    # select resolution of tree
+table(experiment.aggr@ident)
+markers_all <- FindAllMarkers(
+    object = experiment.aggr, 
+    only.pos = TRUE, 
+    min.pct = 0.1, 
+    thresh.use = 0.25
+)
+dim(markers_all)
+table(table(markers_all$gene))
+
+write.csv(markers_all, "markers_res2.csv")
+AllMarkers_res2 <- markers_all
+
+# resolution 4
+rm(markers_all)
+experiment.aggr <- SetAllIdent(experiment.aggr, id = ids[2])    # select resolution of tree
+table(experiment.aggr@ident)
+markers_all <- FindAllMarkers(
+    object = experiment.aggr, 
+    only.pos = TRUE, 
+    min.pct = 0.1, 
+    thresh.use = 0.25
+)
+dim(markers_all)
+table(table(markers_all$gene))
+
+write.csv(markers_all, "markers_res4.csv")
+AllMarkers_res4 <- markers_all
+
+#
+markers_all_single <- markers_all[markers_all$gene %in% names(table(markers_all$gene))[table(markers_all$gene) == 1],]
+dim(markers_all_single)
+table(table(markers_all_single$gene))
+
+```
+
+
+
+```{r}
+ids = c("res.2","res.4")
+setwd("C:/Users/kicheol/Desktop/Projects/Andres_scRNA/Results_Seurat_new_NoCorrection/AllCells/res2")
+
+experiment.aggr <- SetAllIdent(experiment.aggr, id = ids[2])
+table(experiment.aggr@ident)
+markers_all <- AllMarkers_res4
+
+tmp_cluster <- markers_all[markers_all$cluster==0,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster00.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[37:45], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==1,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster01.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==2,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster02.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[37:45], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==3,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster03.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==4,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster04.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==5,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster05.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==6,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster06.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==7,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster07.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==8,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster08.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==9,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster09.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+
+tmp_cluster <- markers_all[markers_all$cluster==10,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster10.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==11,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster11.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==12,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster12.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==13,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster13.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==14,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster14.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:27], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==15,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster15.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:23], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==16,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster16.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:23], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==17,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster17.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:23], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+tmp_cluster <- markers_all[markers_all$cluster==18,]
+tmp_cluster <- subset(tmp_cluster, tmp_cluster$p_val_adj < 0.05)
+pdf("VlnPlot_markers_cluster18.pdf", paper="letter")
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[1:9], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[10:18], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[19:23], point.size.use = 0.2)
+VlnPlot(object = experiment.aggr, features.plot = tmp_cluster[order(tmp_cluster$avg_logFC, decreasing=TRUE),]$gene[28:36], point.size.use = 0.2)
+dev.off()
+
+setwd("C:/Users/kicheol/Desktop/Projects/Andres_scRNA/Results_Seurat_new")
+```
+
+
+## Finishing up clusters.
+
+At this point in time you should use the tree, markers, domain knowledge, and goals to finalize your clusters. This may mean adjusting PCA to use, mergers clusters together, choosing a new resolutions, etc. When finished you can further name it cluster by something more informative. Ex.
+```{r}
+experiment.aggr <- SetAllIdent(experiment.aggr, id = "res.3.5")    # select resolution of tree
+table(experiment.aggr@ident)
+TSNEPlot(object = experiment.aggr, pt.size=1, do.label = T)
+
+
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('0'),
+  new.ident.name = 'Neuronal Cell 3'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('1'),
+  new.ident.name = 'Neuronal Cell 1'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('2'),
+  new.ident.name = 'Macrophage 1'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('3'),
+  new.ident.name = 'Microglia 1'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('4'),
+  new.ident.name = 'Retinal Cell 3'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('5'),
+  new.ident.name = 'Microglia 2'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('6'),
+  new.ident.name = 'Retinal Cell 2'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('7'),
+  new.ident.name = 'Microglia 3'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('8'),
+  new.ident.name = 'Neuronal Cell 7'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('9'),
+  new.ident.name = 'Macrophage 2'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('10'),
+  new.ident.name = 'Neuronal Cell 5'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('11'),
+  new.ident.name = 'Neuronal Cell 2'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('12'),
+  new.ident.name = 'Microglia 4'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('13'),
+  new.ident.name = 'Retinal Cell 1'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('14'),
+  new.ident.name = 'Neuronal Cell 4'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('15'),
+  new.ident.name = 'Neuronal Cell 6'
+)
+experiment.aggr <- RenameIdent(
+  object = experiment.aggr,
+  old.ident.name = c('16'),
+  new.ident.name = 'NK Cell'
+)
+
+# save final cluster (cluster or names) to metadata
+experiment.aggr <- AddMetaData(
+  object = experiment.aggr,
+  metadata = experiment.aggr@ident,
+  col.name = "finalcluster_all")
+
+TSNEPlot(object = experiment.aggr, group.by="finalcluster_all", pt.size=1.5, do.label = T)
+
+
+VlnPlot(object = experiment.aggr, group.by="res.4", features.plot = c("Neurod4"))
+
+#experiment.clusters.res0.5 <- experiment.clusters
+#experiment.clusters <- experiment.clusters.res0.5
+#table(experiment.clusters@ident)
+
+#TSNEPlot(object = experiment.clusters, pt.size=1, do.label = T, label.size=3.5)   # tSNE_plot_res3.5_labeled
+#TSNEPlot(object = experiment.clusters, pt.size=1, do.label = T, pt.shape="orig.ident", label.size=3.5)  # tSNE_plot_res3.5_labeled_shaped
+#TSNEPlot(object = experiment.clusters, group.by="orig.ident", pt.size=1)
+#TSNEPlot(object = experiment.clusters, pt.size=0.8, do.label = T)
+
+```
+
+
+And last lets save all the objects in our session.
+```{r}
+save(list=ls(), file="seurat_all_clusters.RData")
+```
+
+Session Information
+```{r}
+sessionInfo()
+```
