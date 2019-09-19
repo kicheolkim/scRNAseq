@@ -11,3 +11,5 @@ Run on QB3 cluster (UCSF cluster server)
 
 -----
 Created by Kicheol Kim, PhD (Feb, 2018)
+
+Baranzini Lab. (https://github.com/baranzini-lab), Department of Neurology, UCSF
