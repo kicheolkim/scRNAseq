@@ -1,6 +1,7 @@
 # single-cell RNA-seq analysis using Seurat
 
-Analysis code for single-cell RNA-Seq dataset using 10xGenomics platform, which of the manuscript in preparation
+Analysis code for single-cell RNA-Seq dataset using 10xGenomics platform, collaboration with Andrés Cruz-Herranz
+Manuscript in preparation, result was presented in ECTRIMS 2018
 
 ## Analysis workflow
 ### 1. CellRanger for mapping and gene counting
