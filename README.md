@@ -5,12 +5,14 @@ Manuscript in preparation, result was presented in ECTRIMS 2018
 
 ## Analysis workflow
 ### 1. CellRanger for mapping and gene counting
-Run on QB3 cluster (UCSF cluster server)
+- Mapping with reference genome, quantify gene expression (counting reads), and QC
+- Run on QB3 cluster (UCSF cluster server)
 
 ### 2. Seurat (R package) for normalization and clustering
-Discover cell clusters and identify cell types of each cluster.
-Comparison of change in cell number between different time-point.
-Differential gene expression analysis for cell sub-population.
+- Normalization of gene counts in each cell
+- Discover cell clusters and identify cell types of each cluster.
+- Comparison of change in cell number between different time-point.
+- Differential gene expression analysis for cell sub-population.
 
 -----
 Created by Kicheol Kim, PhD (Feb, 2018)
