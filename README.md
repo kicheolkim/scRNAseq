@@ -6,7 +6,7 @@ Manuscript in preparation, result was presented in ECTRIMS 2018
 ## Analysis workflow
 ### 1. CellRanger for mapping and gene counting
 - Mapping with reference genome, quantify gene expression (counting reads), and QC
-- Run on QB3 cluster (UCSF cluster server)
+- This is the script for run on QB3 cluster (UCSF cluster server)
 
 ### 2. Seurat (R package) for normalization and clustering
 - Normalization of gene counts in each cell
