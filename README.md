@@ -7,7 +7,7 @@ Manuscript in preparation, result was presented in ECTRIMS 2018
 ### 1. CellRanger for mapping and gene counting
 Run on QB3 cluster (UCSF cluster server)
 
-### 2. Seurat for normalization and clustering (in R)
+### 2. Seurat (R package) for normalization and clustering
 Discover cell clusters and identify cell types of each cluster.
 Comparison of change in cell number between different time-point.
 Differential gene expression analysis for cell sub-population.
